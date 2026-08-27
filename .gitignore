@@ -20,3 +20,5 @@ Thumbs.db
 # Docker volumes if mounted locally
 mysql_data/
 mongo_data/
+
+.claude/

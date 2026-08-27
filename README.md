@@ -1,13 +1,16 @@
 # Travel Booking System
 
-A Python/FastAPI backend split into 4 independent microservices, sharing one
-MySQL instance (separate tables per service) and one MongoDB instance (for
-reviews).
+A Python/FastAPI backend split into 6 independent microservices, sharing one
+MySQL instance (separate tables per service), one MongoDB instance (for
+reviews), Kafka (for booking events), and Redis (for cache-aside lookups and
+the AI service's deal scores).
 
 - User Service — port 8001
 - Flight Service — port 8002
 - Hotel Service — port 8003
 - Billing Service — port 8004
+- Notification Service — port 8005 (Kafka consumer, no routes beyond `/health`)
+- AI Recommendation Service — port 8006
 
 ## How to run
 
@@ -46,6 +49,10 @@ Each service exposes interactive Swagger docs at `/docs`:
 - http://localhost:8002/docs (Flight Service)
 - http://localhost:8003/docs (Hotel Service)
 - http://localhost:8004/docs (Billing Service)
+- http://localhost:8006/docs (AI Recommendation Service)
+
+(Notification Service exposes no Swagger docs worth visiting - it's a
+background Kafka consumer with only `/health`.)
 
 Or with curl:
 
@@ -81,6 +88,77 @@ curl -X POST http://localhost:8004/bookings \
     "item_id": "AA1000", "amount": "349.99", "payment_method": "credit_card"
   }'
 ```
+
+## AI Recommendation Service
+
+Two agents inside `services/ai_service/`, both reading the same MySQL
+`flights`/`hotels` tables that Flight Service and Hotel Service own:
+
+**Deals Agent** (background worker, `deals_agent.py` + `scheduler.py`) runs
+every 60 seconds and scores every flight against the average price for its
+route (`departure_airport` + `arrival_airport`) and every hotel against the
+average nightly price for its `city`. Anything 15%+ below its group's
+average is flagged `is_deal: true`. Scores are kept in an in-memory
+snapshot (not Redis) - the whole snapshot is recomputed from scratch every
+cycle, only this one process ever reads it, and Python's reference
+reassignment is atomic, so there's nothing a persistent cache would buy
+here. Inspect the current snapshot directly:
+
+```bash
+curl "http://localhost:8006/deals?top_n=5"
+```
+
+**Concierge Agent** (`recommender.py`, exposed as `POST /recommend`) pairs
+flights and hotels from that snapshot into bundles that fit a budget,
+ranked by combined deal quality, returning up to 3 distinct bundles (no
+repeated flight or hotel across picks). `origin`/`destination` filter by
+airport code and `city` filters hotels by name - the two are applied
+independently, since the seed data doesn't link airport codes to the
+random city names hotels get, so there's no "same destination" to match
+flights and hotels against. `why_this_pick` is built entirely from
+template text over real fields (price, average, star rating) - no LLM
+call, so it can't state a number that isn't true.
+
+```bash
+curl -X POST http://localhost:8006/recommend \
+  -H "Content-Type: application/json" \
+  -d '{
+    "budget": 300,
+    "start_date": "2026-09-01",
+    "end_date": "2026-09-04"
+  }'
+```
+
+```json
+{
+  "recommendations": [
+    {
+      "flight": {
+        "flight_id": "B68118", "airline": "JetBlue Airways",
+        "departure_airport": "SLC", "arrival_airport": "TPA",
+        "price": "50.32", "group_average_price": "1075.24",
+        "pct_below_avg": "0.9532", "is_deal": true
+      },
+      "hotel": {
+        "hotel_id": "HT101025", "name": "Short-Soto Hotel",
+        "city": "Wilsonmouth", "star_rating": 5,
+        "price_per_night": "50.04", "group_average_price": "333.71",
+        "pct_below_avg": "0.8500", "is_deal": true
+      },
+      "nights": 3,
+      "total_estimated_cost": "200.44",
+      "why_this_pick": "Flight is 95% below the average price for SLC-TPA ($50.32). Hotel is 85% below the average nightly price in Wilsonmouth ($50.04/night x 3 nights), 5-star."
+    }
+  ],
+  "message": null
+}
+```
+
+Exact ids/prices above came from one run against seeded data and will
+differ after any reseed - `seed_data.py` generates prices and cities
+randomly. Add `origin`, `destination`, and/or `city` to narrow the search;
+if nothing fits, `recommendations` is `[]` and `message` explains why
+(unmatched filter vs. budget too low).
 
 ## Why these design choices
 
@@ -135,6 +213,8 @@ travel-booking-system/
     flight_service/      (port 8002)
     hotel_service/        (port 8003)
     billing_service/        (port 8004)
+    notification_service/     (port 8005)
+    ai_service/                 (port 8006)
   common/
     auth.py             (shared JWT + bcrypt helpers)
     mongo.py            (shared MongoDB connection for reviews)
